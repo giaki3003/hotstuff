@@ -1,4 +1,4 @@
-use crate::config::Committee;
+use crate::config::{Committee, EpochNumber};
 use crate::consensus::Round;
 use crate::messages::{Block, Timeout, Vote, QC};
 use bytes::Bytes;
@@ -50,6 +50,7 @@ impl Block {
         qc: QC,
         author: PublicKey,
         round: Round,
+        epoch: EpochNumber,
         payload: Vec<Digest>,
         secret: &SecretKey,
     ) -> Self {
@@ -58,6 +59,7 @@ impl Block {
             tc: None,
             author,
             round,
+            epoch,
             payload,
             signature: Signature::default(),
         };
@@ -116,7 +118,7 @@ impl PartialEq for Timeout {
 // Fixture.
 pub fn block() -> Block {
     let (public_key, secret_key) = keys().pop().unwrap();
-    Block::new_from_key(QC::genesis(), public_key, 1, Vec::new(), &secret_key)
+    Block::new_from_key(QC::genesis(), public_key, 1, 1, Vec::new(), &secret_key)
 }
 
 // Fixture.
@@ -155,6 +157,7 @@ pub fn chain(keys: Vec<(PublicKey, SecretKey)>) -> Vec<Block> {
                 latest_qc.clone(),
                 *public_key,
                 1 + i as Round,
+                1,
                 Vec::new(),
                 secret_key,
             );

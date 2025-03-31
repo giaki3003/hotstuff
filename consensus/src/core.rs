@@ -1,5 +1,5 @@
 use crate::aggregator::Aggregator;
-use crate::config::Committee;
+use crate::config::{Committee, EpochNumber};
 use crate::consensus::{ConsensusMessage, Round};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
@@ -23,6 +23,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
+const ROUNDS_PER_EPOCH: Round = 5000; // 5k rounds/epoch gives us around 7 epochs per 20s bench run (assuming ~950 tx/s e2e, at 1k tx/s input)
+
 pub struct Core {
     name: PublicKey,
     committee: Committee,
@@ -38,6 +40,7 @@ pub struct Core {
     round: Round,
     last_voted_round: Round,
     last_committed_round: Round,
+    current_epoch: EpochNumber,
     high_qc: QC,
     timer: Timer,
     aggregator: Aggregator,
@@ -76,6 +79,7 @@ impl Core {
                 round: 1,
                 last_voted_round: 0,
                 last_committed_round: 0,
+                current_epoch: 1,
                 high_qc: QC::genesis(),
                 timer: Timer::new(timeout_delay),
                 aggregator: Aggregator::new(committee),
@@ -270,6 +274,33 @@ impl Core {
         if round < self.round {
             return;
         }
+
+        // Check if the round we are *completing* is the last of an epoch.
+        // Example: If ROUNDS_PER_EPOCH is 10:
+        // - Completing round 9 means next is round 10 (epoch 2). Change needed.
+        // - Completing round 19 means next is round 20 (epoch 3). Change needed.
+        // This assumes epochs E=1, 2, ... contain rounds (E-1)*N to E*N - 1.
+        // And round numbers start at 1 (genesis block is round 0, QC is round 0, first proposal is round 1).
+        // If round is the number of the block/QC triggering the advance:
+        // We advance *to* round + 1. Check if round + 1 starts a new epoch.
+        let next_round = round + 1;
+        if next_round > 0 && next_round % ROUNDS_PER_EPOCH == 0 { // Check if the *next* round is a multiple
+            // --- Epoch Change Triggered ---
+
+            // 1. Get the *new* epoch number
+            let new_epoch_number = (next_round / ROUNDS_PER_EPOCH) + 1; // Calculate the epoch we are entering
+
+            // 2. Update Core's current epoch tracker
+            self.current_epoch = new_epoch_number as EpochNumber;
+
+            // 3. Log the change
+            info!(
+                "EPOCH CHANGE: Preparing for round {}, entering Epoch {}",
+                next_round,
+                self.current_epoch
+            );
+        }
+
         // Reset the timer and advance round.
         self.timer.reset();
         self.round = round + 1;
@@ -282,7 +313,7 @@ impl Core {
     #[async_recursion]
     async fn generate_proposal(&mut self, tc: Option<TC>) {
         self.tx_proposer
-            .send(ProposerMessage::Make(self.round, self.high_qc.clone(), tc))
+            .send(ProposerMessage::Make(self.round, self.current_epoch, self.high_qc.clone(), tc))
             .await
             .expect("Failed to send message to proposer");
     }

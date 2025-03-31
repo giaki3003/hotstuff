@@ -91,11 +91,12 @@ class LogParser:
         if search(r'panic', log) is not None:
             raise ParseError('Node(s) panicked')
 
-        tmp = findall(r'\[(.*Z) .* Created B\d+ -> ([^ ]+=)', log)
+        # Since the new block structure prints out the round and the epoch, we slightly change the regex here for both Created and Committed logs
+        tmp = findall(r'\[(.*Z) .* Created B\d+(?:,\s*\d+)? -> ([^ ]+=)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+ -> ([^ ]+=)', log)
+        tmp = findall(r'\[(.*Z) .* Committed B\d+(?:,\s*\d+)? -> ([^ ]+=)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
