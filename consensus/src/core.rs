@@ -1,6 +1,6 @@
 use crate::aggregator::Aggregator;
 use crate::config::{Committee, EpochNumber};
-use crate::consensus::{ConsensusMessage, Round};
+use crate::consensus::{ConsensusMessage, Round, CoreStartMode};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
 use crate::mempool::MempoolDriver;
@@ -8,6 +8,7 @@ use crate::messages::{Block, Timeout, Vote, QC, TC};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::timer::Timer;
+use crate::helper::HelperRequest;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use crypto::Hash as _;
@@ -18,6 +19,9 @@ use std::cmp::max;
 use std::collections::VecDeque;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+#[cfg(feature = "fast-sync")]
+use tokio::time::{sleep, Duration};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -45,6 +49,7 @@ pub struct Core {
     timer: Timer,
     aggregator: Aggregator,
     network: SimpleSender,
+    tx_helper: Sender<HelperRequest>,
 }
 
 impl Core {
@@ -62,6 +67,8 @@ impl Core {
         rx_loopback: Receiver<Block>,
         tx_proposer: Sender<ProposerMessage>,
         tx_commit: Sender<Block>,
+        start_mode: CoreStartMode,
+        tx_helper: Sender<HelperRequest>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -76,6 +83,7 @@ impl Core {
                 rx_loopback,
                 tx_proposer,
                 tx_commit,
+                tx_helper,
                 round: 1,
                 last_voted_round: 0,
                 last_committed_round: 0,
@@ -85,7 +93,7 @@ impl Core {
                 aggregator: Aggregator::new(committee),
                 network: SimpleSender::new(),
             }
-            .run()
+            .run(start_mode)
             .await
         });
     }
@@ -333,6 +341,27 @@ impl Core {
     }
 
     async fn process_qc(&mut self, qc: &QC) {
+        // Check if processing this QC completes an epoch
+        let next_round = qc.round + 1; // The round number we would enter *after* this block
+
+        // Ensure we don't checkpoint for Genesis (qc.round 0)
+        // Check if qc.round is the last round of an epoch
+        if qc.round > 0 && next_round % ROUNDS_PER_EPOCH == 0 {
+            let digest = qc.hash.clone(); // The digest of the block certified by this QC (last block of epoch)
+
+            // This block is the last one of the epoch ending at qc.round.
+            // Send an update to the Helper task to mark this block's digest as the new checkpoint.
+            info!(
+                "Core: Epoch {} ending. Marking block {} (Round {}) as the new checkpoint.",
+                self.current_epoch, // Log epoch number *before* advance_round might update it
+                digest,
+                qc.round
+            );
+            if let Err(e) = self.tx_helper.send(HelperRequest::UpdateCheckpoint(digest)).await {
+                // Log error but don't necessarily stop consensus progress
+                error!("Core: Failed to send checkpoint update to Helper: {}", e);
+            }
+        }
         self.advance_round(qc.round).await;
         self.update_high_qc(qc);
     }
@@ -440,24 +469,143 @@ impl Core {
         Ok(())
     }
 
-    pub async fn run(&mut self) {
-        // Upon booting, generate the very first block (if we are the leader).
-        // Also, schedule a timer in case we don't hear from the leader.
+    #[cfg_attr(not(feature = "fast-sync"), allow(unused_variables))]
+    pub async fn run(&mut self, start_mode: CoreStartMode) {
+        // Log the received mode IMMEDIATELY for debugging
+        info!("Core::run entered with start_mode: {:?}", start_mode);
+        // --- Fast Sync Initialization Phase ---
+        // This block only runs if the 'fast-sync' feature is enabled AND
+        // the start_mode requests it.
+        #[cfg(feature = "fast-sync")]
+        if matches!(start_mode, CoreStartMode::FastSync) {
+            info!("Fast Sync: Core entering sync mode...");
+            const FAST_SYNC_TIMEOUT_MS: u64 = 10_000; // 10 second timeout
+
+            // 1. Request Checkpoint from a peer
+            // Simplification: Ask the first peer we know (excluding ourselves)
+            let peers = self.committee.broadcast_addresses(&self.name);
+            let mut checkpoint_fetched = false;
+            if let Some((_peer_name, peer_addr)) = peers.first() {
+                info!("Fast Sync: Requesting checkpoint from {}", peer_addr);
+                let request = ConsensusMessage::SyncCheckpointRequest(self.name);
+                match bincode::serialize(&request) {
+                    Ok(serialized_request) => {
+                        self.network.send(*peer_addr, Bytes::from(serialized_request)).await;
+                    }
+                    Err(e) => {
+                        error!("Fast Sync: Failed to serialize checkpoint request: {}", e);
+                        // Proceed to normal startup without checkpoint
+                    }
+                }
+
+                // 2. Wait for Response or Timeout
+                let deadline = sleep(Duration::from_millis(FAST_SYNC_TIMEOUT_MS));
+                tokio::pin!(deadline);
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        // Check for incoming messages
+                        maybe_message = self.rx_message.recv() => {
+                            match maybe_message {
+                                Some(ConsensusMessage::SyncCheckpointResponse(Some(checkpoint_block))) => {
+                                    info!("Fast Sync: Received checkpoint block {}", checkpoint_block);
+
+                                    // --- PoC Verification ---
+                                    // WARNING: Very happy-path approach.
+                                    match checkpoint_block.verify(&self.committee) {
+                                        Ok(()) => {
+                                            info!("Fast Sync: Checkpoint verified (basic). Initializing state.");
+                                            // TODO: Ideally, fetch parent block too to ensure commit rules work
+                                            // For PoC, we might skip this, but log a warning. We also might have
+                                            // some specific finality logic but deffo out of scope.
+                                            warn!("Fast Sync PoC: Parent block of checkpoint not fetched/verified.");
+
+                                            // Initialize Core state based on the checkpoint
+                                            self.current_epoch = checkpoint_block.epoch;
+                                            self.round = checkpoint_block.round + 1; // Start round *after* checkpoint
+                                            self.high_qc = checkpoint_block.qc.clone();
+                                            self.last_voted_round = checkpoint_block.round;
+                                            // Simplification: Set commit round based on QC. Not fully correct finality.
+                                            self.last_committed_round = self.high_qc.round;
+
+                                            // Store the checkpoint block
+                                            self.store_block(&checkpoint_block).await;
+                                            checkpoint_fetched = true; // Mark success
+                                            break; // Exit the response waiting loop
+                                        }
+                                        Err(e) => {
+                                            warn!("Fast Sync: Received invalid checkpoint block: {}", e);
+                                            // Continue waiting for potentially other responses or timeout
+                                        }
+                                    }
+                                }
+                                Some(ConsensusMessage::SyncCheckpointResponse(None)) => {
+                                    info!("Fast Sync: Peer responded with no checkpoint block.");
+                                    // Continue waiting
+                                }
+                                Some(other_message) => {
+                                    // It's possible other messages arrive while waiting. Just log.
+                                    warn!("Fast Sync: Ignoring non-checkpoint message {:?} during sync phase", other_message);
+                                }
+                                None => { // Channel closed
+                                     warn!("Fast Sync: Message channel closed unexpectedly. Starting from Genesis.");
+                                     break; // Exit the response waiting loop
+                                }
+                            }
+                        },
+
+                        // Handle timeout
+                        () = &mut deadline => {
+                            warn!("Fast Sync: Timeout waiting for checkpoint response. Starting from Genesis.");
+                            break; // Exit the response waiting loop
+                        },
+                    }
+                } // End of response waiting loop
+
+            } else {
+                warn!("Fast Sync: No peers found to request checkpoint from. Starting from Genesis.");
+            }
+
+            // If sync failed, core state remains at Genesis defaults. If succeeded, it's updated.
+             if checkpoint_fetched {
+                 info!("Fast Sync: Successfully initialized state from checkpoint.");
+             } else {
+                 info!("Fast Sync: Failed to obtain valid checkpoint, proceeding with Genesis state.");
+             }
+
+        } // End of #[cfg(feature = "fast-sync")] block
+
+
+        // --- Normal Startup / Post-Sync ---
+        // Initialize timer and potentially generate first block based on the current state
+        // (which might be Genesis or from fast sync)
         self.timer.reset();
+        info!("Core starting normal operation at Epoch {}, Round {}", self.current_epoch, self.round);
         if self.name == self.leader_elector.get_leader(self.round) {
+            // generate_proposal uses self.round, self.current_epoch, self.high_qc which are now set correctly.
             self.generate_proposal(None).await;
         }
 
-        // This is the main loop: it processes incoming blocks and votes,
-        // and receive timeout notifications from our Timeout Manager.
+        // --- Main Loop ---
         loop {
             let result = tokio::select! {
-                Some(message) = self.rx_message.recv() => match message {
-                    ConsensusMessage::Propose(block) => self.handle_proposal(&block).await,
-                    ConsensusMessage::Vote(vote) => self.handle_vote(&vote).await,
-                    ConsensusMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,
-                    ConsensusMessage::TC(tc) => self.handle_tc(tc).await,
-                    _ => panic!("Unexpected protocol message")
+                Some(message) = self.rx_message.recv() => {
+                    // Add guards to ignore sync messages during normal operation
+                    match message {
+                        ConsensusMessage::SyncCheckpointRequest(_) | ConsensusMessage::SyncCheckpointResponse(_) => {
+                            warn!("Ignoring sync checkpoint message during normal operation.");
+                            Ok(()) // Return Ok to avoid outer error handling
+                        }
+                        ConsensusMessage::Propose(block) => self.handle_proposal(&block).await,
+                        ConsensusMessage::Vote(vote) => self.handle_vote(&vote).await,
+                        ConsensusMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,
+                        ConsensusMessage::TC(tc) => self.handle_tc(tc).await,
+                        ConsensusMessage::SyncRequest(_,_) => {
+                           warn!("Ignoring SyncRequest received in Core loop.");
+                           Ok(())
+                        }
+                    }
                 },
                 Some(block) = self.rx_loopback.recv() => self.process_block(&block).await,
                 () = &mut self.timer => self.local_timeout_round().await,
@@ -468,6 +616,6 @@ impl Core {
                 Err(ConsensusError::SerializationError(e)) => error!("Store corrupted. {}", e),
                 Err(e) => warn!("{}", e),
             }
-        }
-    }
+        } // End of main loop
+    } // End of run function
 }

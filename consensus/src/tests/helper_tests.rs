@@ -30,7 +30,7 @@ async fn sync_reply() {
     let handle = listener(address, Some(expected));
 
     // Send a sync request.
-    tx_request.send((digest, requestor)).await.unwrap();
+    tx_request.send(HelperRequest::GetBlock(digest, requestor)).await.unwrap();
 
     // Ensure the requestor received the batch (ie. it did not panic).
     assert!(handle.await.is_ok());

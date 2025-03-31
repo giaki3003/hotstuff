@@ -1,6 +1,6 @@
 use crate::config::Export as _;
 use crate::config::{Committee, ConfigError, Parameters, Secret};
-use consensus::{Block, Consensus};
+use consensus::{Block, Consensus, CoreStartMode};
 use crypto::SignatureService;
 use log::info;
 use mempool::Mempool;
@@ -53,6 +53,18 @@ impl Node {
             tx_mempool_to_consensus,
         );
 
+        // Determine the start mode based on the feature flag
+        #[cfg(feature = "fast-sync")]
+        let start_mode = {
+            info!("'fast-sync' feature enabled, instructing Core to attempt fast sync.");
+            CoreStartMode::FastSync
+        };
+        #[cfg(not(feature = "fast-sync"))]
+        let start_mode = {
+            info!("Starting node normally from Genesis.");
+            CoreStartMode::Genesis
+        };
+
         // Run the consensus core.
         Consensus::spawn(
             name,
@@ -63,6 +75,7 @@ impl Node {
             rx_mempool_to_consensus,
             tx_consensus_to_mempool,
             tx_commit,
+            start_mode,
         );
 
         info!("Node {} successfully booted", name);

@@ -6,6 +6,7 @@ use futures::future::try_join_all;
 use std::fs;
 use tokio::sync::mpsc::channel;
 use tokio::task::JoinHandle;
+use crate::consensus::CoreStartMode;
 
 fn spawn_nodes(
     keys: Vec<(PublicKey, SecretKey)>,
@@ -46,6 +47,7 @@ fn spawn_nodes(
                     rx_mempool_to_consensus,
                     tx_consensus_to_mempool,
                     tx_commit,
+                    CoreStartMode::Genesis,
                 );
 
                 rx_commit.recv().await.unwrap()
