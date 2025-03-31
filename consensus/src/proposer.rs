@@ -1,4 +1,4 @@
-use crate::config::{Committee, Stake};
+use crate::config::{Committee, Stake, EpochNumber};
 use crate::consensus::{ConsensusMessage, Round};
 use crate::messages::{Block, QC, TC};
 use bytes::Bytes;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Debug)]
 pub enum ProposerMessage {
-    Make(Round, QC, Option<TC>),
+    Make(Round, EpochNumber, QC, Option<TC>),
     Cleanup(Vec<Digest>),
 }
 
@@ -58,13 +58,14 @@ impl Proposer {
         deliver
     }
 
-    async fn make_block(&mut self, round: Round, qc: QC, tc: Option<TC>) {
+    async fn make_block(&mut self, round: Round, epoch: EpochNumber, qc: QC, tc: Option<TC>) {
         // Generate a new block.
         let block = Block::new(
             qc,
             tc,
             self.name,
             round,
+            epoch,
             /* payload */ self.buffer.drain().collect(),
             self.signature_service.clone(),
         )
@@ -130,7 +131,9 @@ impl Proposer {
                     //}
                 },
                 Some(message) = self.rx_message.recv() => match message {
-                    ProposerMessage::Make(round, qc, tc) => self.make_block(round, qc, tc).await,
+                    ProposerMessage::Make(round, epoch, qc, tc) => {
+                        self.make_block(round, epoch, qc, tc).await
+                    },
                     ProposerMessage::Cleanup(digests) => {
                         for x in &digests {
                             self.buffer.remove(x);

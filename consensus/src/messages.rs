@@ -1,4 +1,4 @@
-use crate::config::Committee;
+use crate::config::{Committee, EpochNumber};
 use crate::consensus::Round;
 use crate::error::{ConsensusError, ConsensusResult};
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
@@ -19,6 +19,7 @@ pub struct Block {
     pub tc: Option<TC>,
     pub author: PublicKey,
     pub round: Round,
+    pub epoch: EpochNumber,
     pub payload: Vec<Digest>,
     pub signature: Signature,
 }
@@ -29,6 +30,7 @@ impl Block {
         tc: Option<TC>,
         author: PublicKey,
         round: Round,
+        epoch: EpochNumber,
         payload: Vec<Digest>,
         mut signature_service: SignatureService,
     ) -> Self {
@@ -37,6 +39,7 @@ impl Block {
             tc,
             author,
             round,
+            epoch,
             payload,
             signature: Signature::default(),
         };
@@ -81,6 +84,7 @@ impl Hash for Block {
         let mut hasher = Sha512::new();
         hasher.update(self.author.0);
         hasher.update(self.round.to_le_bytes());
+        hasher.update(self.epoch.to_le_bytes());
         for x in &self.payload {
             hasher.update(x);
         }
@@ -93,10 +97,11 @@ impl fmt::Debug for Block {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B({}, {}, {:?}, {})",
+            "{}: B({}, {}, {}, {:?}, {})",
             self.digest(),
             self.author,
             self.round,
+            self.epoch,
             self.qc,
             self.payload.iter().map(|x| x.size()).sum::<usize>(),
         )
@@ -105,7 +110,7 @@ impl fmt::Debug for Block {
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "B{}", self.round)
+        write!(f, "B{}, {}", self.round, self.epoch)
     }
 }
 

@@ -100,7 +100,7 @@ async fn generate_proposal() {
     let (next_leader, next_leader_key) = leader_keys(2);
 
     // Make a block, votes, and QC.
-    let block = Block::new_from_key(QC::genesis(), leader, 1, Vec::new(), &leader_key);
+    let block = Block::new_from_key(QC::genesis(), leader, 1, 1, Vec::new(), &leader_key);
     let hash = block.digest();
     let votes: Vec<_> = keys()
         .iter()
@@ -131,8 +131,9 @@ async fn generate_proposal() {
 
     // Ensure the core sends a new block.
     match rx_proposer.recv().await.unwrap() {
-        ProposerMessage::Make(round, qc, tc) => {
+        ProposerMessage::Make(round, epoch, qc, tc) => {
             assert_eq!(round, 2);
+            assert_eq!(epoch, 1);
             assert_eq!(qc, hight_qc);
             assert!(tc.is_none());
         }
