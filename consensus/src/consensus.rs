@@ -1,7 +1,7 @@
 use crate::config::{Committee, Parameters};
 use crate::core::Core;
 use crate::error::ConsensusError;
-use crate::helper::Helper;
+use crate::helper::{Helper, HelperRequest};
 use crate::leader::LeaderElector;
 use crate::mempool::MempoolDriver;
 use crate::messages::{Block, Timeout, Vote, TC};
@@ -36,6 +36,14 @@ pub enum ConsensusMessage {
     Timeout(Timeout),
     TC(TC),
     SyncRequest(Digest, PublicKey),
+    SyncCheckpointRequest(PublicKey), // Request latest checkpoint info from sender
+    SyncCheckpointResponse(Option<Block>), // Respond with the first block of the latest finalized epoch known
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CoreStartMode {
+    Genesis,
+    FastSync,
 }
 
 pub struct Consensus;
@@ -51,6 +59,7 @@ impl Consensus {
         rx_mempool: Receiver<Digest>,
         tx_mempool: Sender<ConsensusMempoolMessage>,
         tx_commit: Sender<Block>,
+        start_mode: CoreStartMode,
     ) {
         // NOTE: This log entry is used to compute performance.
         parameters.log();
@@ -58,7 +67,7 @@ impl Consensus {
         let (tx_consensus, rx_consensus) = channel(CHANNEL_CAPACITY);
         let (tx_loopback, rx_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_proposer, rx_proposer) = channel(CHANNEL_CAPACITY);
-        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
+        let (tx_helper, rx_helper): (Sender<HelperRequest>, Receiver<HelperRequest>) = channel(CHANNEL_CAPACITY);
 
         // Spawn the network receiver.
         let mut address = committee
@@ -70,7 +79,7 @@ impl Consensus {
             /* handler */
             ConsensusReceiverHandler {
                 tx_consensus,
-                tx_helper,
+                tx_helper: tx_helper.clone(),
             },
         );
         info!(
@@ -107,6 +116,8 @@ impl Consensus {
             rx_loopback,
             tx_proposer,
             tx_commit,
+            start_mode,
+            tx_helper,
         );
 
         // Spawn the block proposer.
@@ -128,34 +139,75 @@ impl Consensus {
 #[derive(Clone)]
 struct ConsensusReceiverHandler {
     tx_consensus: Sender<ConsensusMessage>,
-    tx_helper: Sender<(Digest, PublicKey)>,
+    tx_helper: Sender<HelperRequest>,
 }
 
 #[async_trait]
 impl MessageHandler for ConsensusReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(ConsensusError::SerializationError)? {
-            ConsensusMessage::SyncRequest(missing, origin) => self
-                .tx_helper
-                .send((missing, origin))
-                .await
-                .expect("Failed to send consensus message"),
+        // Deserialize the message
+        let message = bincode::deserialize(&serialized);
+
+        // Handle potential deserialization errors
+        let consensus_message: ConsensusMessage = match message {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Log the error and return without crashing
+                log::warn!("Failed to deserialize consensus message: {}", e);
+                // Return the serialization error, wrapped
+                return Err(Box::new(ConsensusError::SerializationError(e)));
+            }
+        };
+
+        match consensus_message {
+            // --- Handle Requests intended for Helper ---
+            ConsensusMessage::SyncRequest(missing, origin) => {
+                // Route to Helper task with the specific request type
+                self.tx_helper
+                    .send(HelperRequest::GetBlock(missing, origin))
+                    .await
+                    // Consider returning Err instead of panic for robustness
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            }
+            ConsensusMessage::SyncCheckpointRequest(origin) => {
+                // Route to Helper task with the specific request type
+                self.tx_helper
+                    .send(HelperRequest::GetCheckpoint(origin))
+                    .await
+                    // Consider returning Err instead of panic
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            }
+
+            // --- Handle Responses or Messages for Core ---
             message @ ConsensusMessage::Propose(..) => {
-                // Reply with an ACK.
+                // ReliableSender expects an ACK for proposals
                 let _ = writer.send(Bytes::from("Ack")).await;
 
                 // Pass the message to the consensus core.
                 self.tx_consensus
                     .send(message)
                     .await
-                    .expect("Failed to consensus message")
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?;
             }
-            message => self
-                .tx_consensus
-                .send(message)
-                .await
-                .expect("Failed to consensus message"),
+            message @ ConsensusMessage::SyncCheckpointResponse(..) => {
+                // This is a response to *our* request during fast-sync startup.
+                // Route it to the Core, which needs logic (under cfg flag) to handle it.
+                // SimpleSender used for the response doesn't need an ACK from us here.
+                self.tx_consensus
+                    .send(message)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            }
+
+            // --- Default Handler for other Core messages (Vote, Timeout, TC) ---
+            message => {
+                // These messages (Vote, Timeout, TC) typically don't require ACKs in this design
+                 // Pass the message to the consensus core.
+                self.tx_consensus
+                    .send(message)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            }
         }
         Ok(())
     }

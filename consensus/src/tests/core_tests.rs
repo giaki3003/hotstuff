@@ -20,6 +20,7 @@ fn core(
     let (tx_proposer, rx_proposer) = channel(1);
     let (tx_mempool, mut rx_mempool) = channel(1);
     let (tx_commit, rx_commit) = channel(1);
+    let (tx_helper, _rx_helper): (Sender<HelperRequest>, Receiver<HelperRequest>) = channel(1);
 
     let signature_service = SignatureService::new(secret);
     let _ = fs::remove_dir_all(store_path);
@@ -53,6 +54,8 @@ fn core(
         rx_loopback,
         tx_proposer,
         tx_commit,
+        CoreStartMode::Genesis,
+        tx_helper,
     );
 
     (tx_core, rx_proposer, rx_commit)

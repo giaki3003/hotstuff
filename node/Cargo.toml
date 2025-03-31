@@ -27,6 +27,7 @@ mempool = { path = "../mempool" }
 
 [features]
 benchmark = ["consensus/benchmark", "mempool/benchmark"]
+fast-sync = ["consensus/fast-sync"]
 
 [[bin]]         
 name = "client"   

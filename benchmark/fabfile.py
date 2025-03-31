@@ -1,11 +1,17 @@
 from fabric import task
+import subprocess
+import os
+from time import sleep
+from math import ceil
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
 from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
-from benchmark.remote import Bench, BenchError
+from benchmark.remote import Bench, BenchError, PathMaker
+from benchmark.commands import CommandMaker
+from benchmark.config import Key, LocalCommittee, NodeParameters, ConfigError
 
 
 @task
@@ -153,3 +159,154 @@ def logs(ctx):
         print(LogParser.process("./logs", faults="?").result())
     except ParseError as e:
         Print.error(BenchError("Failed to parse logs", e))
+
+# Params for the fast sync showcase
+DEFAULT_TEST_NODES = 4
+DEFAULT_TARGET_NODE_ID = 0 # Node to restart
+DEFAULT_PHASE1_DURATION = 30 # Seconds for initial run
+DEFAULT_PHASE2_DURATION = 10 # Seconds to observe restarted node
+
+# Node parameters (here are the same as local run)
+node_params_dict = {
+    "consensus": {
+        "timeout_delay": 1_000,
+        "sync_retry_delay": 10_000,
+    },
+    "mempool": {
+        "gc_depth": 50,
+        "sync_retry_delay": 5_000,
+        "sync_retry_nodes": 3,
+        "batch_size": 15_000,
+        "max_batch_delay": 100,
+    },
+}
+
+# Helper function to run command in tmux
+def run_in_tmux(command, log_file):
+    name = os.path.splitext(os.path.basename(log_file))[0]
+    cmd = f'{command} > {log_file} 2>&1'
+    subprocess.run(['tmux', 'new', '-d', '-s', name, cmd], check=False)
+
+# Helper function to kill tmux session
+def kill_tmux(session_name):
+     subprocess.run(['tmux', 'kill-session', '-t', session_name], stderr=subprocess.DEVNULL)
+
+@task
+def local_fast_sync(ctx, nodes=DEFAULT_TEST_NODES, target_node=DEFAULT_TARGET_NODE_ID, duration1=DEFAULT_PHASE1_DURATION):
+    """
+    Runs a local test scenario for fast-sync startup, including cleanup.
+    """
+    Print.heading("Starting Local Fast-Sync Test Scenario")
+    # Keep track of started session names for cleanup
+    initial_node_sessions = [f'node-{i}' for i in range(nodes)]
+    restarted_node_session = f'node-{target_node}_restarted' # Name based on log file used
+
+    try:
+        # --- 0. Initial Cleanup ---
+        Print.info("Initial cleanup...")
+        # Kill previous sessions using expected names
+        for i in range(nodes):
+             kill_tmux(f'node-{i}')
+             kill_tmux(f'node-{i}_restarted') # Kill restarted session too if exists
+        # Cleanup
+        cmd_clean = f'{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}'
+        subprocess.run([cmd_clean], shell=True, stderr=subprocess.DEVNULL)
+        sleep(0.5)
+
+        # --- 1. Build Default Binary ---
+        Print.info("Building default node binary...")
+        cmd_build_default = CommandMaker.compile().split()
+        subprocess.run(cmd_build_default, cwd=PathMaker.node_crate_path(), check=True)
+        # Alias the just-built binary
+        subprocess.run([CommandMaker.alias_binaries(PathMaker.binary_path())], shell=True)
+
+        # --- 2. Generate Configs ---
+        Print.info("Generating configuration files...")
+        keys = []
+        key_files = [PathMaker.key_file(i) for i in range(nodes)]
+        for i, filename in enumerate(key_files):
+            cmd = CommandMaker.generate_key(filename).split()
+            subprocess.run(cmd, check=True)
+            keys.append(Key.from_file(filename))
+
+        names = [x.name for x in keys]
+        committee = LocalCommittee(names, 9500)
+        committee.print(PathMaker.committee_file())
+
+        node_parameters = NodeParameters(node_params_dict)
+        node_parameters.print(PathMaker.parameters_file())
+
+        # --- 3. Run Initial Cluster (Phase 1) ---
+        Print.info(f"Starting initial cluster ({nodes} nodes) for {duration1} seconds...")
+        # Start nodes using the default binary
+        for i in range(nodes):
+            cmd = CommandMaker.run_node(
+                PathMaker.key_file(i),
+                PathMaker.committee_file(),
+                PathMaker.db_path(i),
+                PathMaker.parameters_file(),
+                debug=True
+            )
+            log_file = PathMaker.node_log_file(i)
+            run_in_tmux(cmd, log_file)
+            Print.info(f"Node {i} started. Log: {log_file}")
+
+        Print.info(f"Waiting {duration1} seconds for cluster to run past epoch 1...")
+        sleep(duration1)
+
+        # --- 4. Stop Target Node ---
+        Print.info(f"Stopping target node {target_node}...")
+        kill_tmux(f'node-{target_node}')
+        sleep(1) # Give it a moment to die
+
+        # --- 5. Clear Target Store ---
+        Print.info(f"Clearing store for target node {target_node}...")
+        db_path = PathMaker.db_path(target_node)
+        subprocess.run(f'rm -rf {db_path}', shell=True, check=False)
+
+        # --- 6. Build Fast-Sync Binary ---
+        Print.info("Building node binary with 'fast-sync' feature...")
+        # Explicitly add features.
+        cmd_build_fast_sync = [
+            'cargo', 'build', '--release',
+            '--features', 'fast-sync' # Add fast-sync feature
+        ]
+        subprocess.run(cmd_build_fast_sync, cwd=PathMaker.node_crate_path(), check=True)
+        # Re-alias binaries to use the new build
+        subprocess.run([CommandMaker.alias_binaries(PathMaker.binary_path())], shell=True)
+
+        # --- 7. Restart Target Node ---
+        Print.info(f"Restarting target node {target_node} using fast-sync binary...")
+        cmd_restart = CommandMaker.run_node(
+            PathMaker.key_file(target_node),
+            PathMaker.committee_file(),
+            PathMaker.db_path(target_node),
+            PathMaker.parameters_file(),
+            debug=True
+        )
+        log_file_restarted = f"{PathMaker.logs_path()}/node-{target_node}_restarted.log"
+        run_in_tmux(cmd_restart, log_file_restarted)
+
+        # --- 8. Inform User ---
+        Print.heading("Fast Sync Local Test Scenario Initialized!")
+
+        # --- 9. Wait and Cleanup ---
+        Print.info(f"Waiting {DEFAULT_PHASE2_DURATION}s before cleaning up...")
+        sleep(DEFAULT_PHASE2_DURATION)
+
+    except (subprocess.SubprocessError, ConfigError, BenchError) as e:
+        Print.error(BenchError(f"Local fast-sync test failed: {e}", e))
+        # Ensure cleanup happens even on error
+    except Exception as e:
+         Print.error(BenchError(f"An unexpected error occurred: {e}", e))
+        # Ensure cleanup happens even on error
+    finally:
+        # --- FINAL CLEANUP ---
+        Print.info("Cleaning up test nodes...")
+        for i in range(nodes):
+            # Kill initial nodes that weren't the target (target was already killed)
+            if i != target_node:
+                kill_tmux(f'node-{i}')
+        # Kill the restarted node session
+        kill_tmux(restarted_node_session)
+        Print.info("Cleanup complete.")
